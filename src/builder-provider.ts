@@ -135,9 +135,10 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
 
   private readonly settings: BuilderChatSettings;
   private readonly config: BuilderConfig;
-  private readonly defaultSessionId = "ai-sdk-" + randomUUID();
+  private defaultSessionId = "ai-sdk-" + randomUUID();
   /** Sessions that already hold history on the Builder side. */
   private readonly knownSessions = new Set<string>();
+  private readonly sessionPrompts = new Map<string, string>();
 
   constructor(modelId: string, settings: BuilderChatSettings, config: BuilderConfig) {
     this.modelId = modelId;
@@ -155,64 +156,30 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
   }
 
   async doGenerate(options: LanguageModelV3CallOptions): Promise<LanguageModelV3GenerateResult> {
-    const { body, warnings, toolNames } = await this.prepare(options);
-    const response = await this.post(body, options.abortSignal, options.headers);
-    const text = await response.text();
-
+    const result = await this.doStream(options);
+    const reader = result.stream.getReader();
     const content: LanguageModelV3Content[] = [];
-    let textBuf = "";
-    let reasoningBuf = "";
-    let finish: LanguageModelV3FinishReason | undefined;
-    let sawToolCall = false;
-    let streamError: BuilderEvent | undefined;
-
-    const flush = () => {
-      if (reasoningBuf) content.push({ type: "reasoning", text: reasoningBuf });
-      if (textBuf) content.push({ type: "text", text: textBuf });
-      reasoningBuf = "";
-      textBuf = "";
-    };
-
-    for (const line of text.split("\n")) {
-      const event = parseLine(line);
-      if (!event) continue;
-      switch (event.type) {
-        case "thinking":
-          if (event.content) reasoningBuf += event.content;
-          break;
-        case "delta":
-        case "text":
-          if (event.content) textBuf += event.content;
-          break;
-        case "tool":
-          flush();
-          content.push(this.toolCall(event, toolNames));
-          sawToolCall = true;
-          break;
-        case "error":
-          streamError = event;
-          break;
-        case "done":
-          finish = mapFinishReason(event.stopReason);
-          break;
+    const text = new Map<string, {type:"text"|"reasoning";text:string}>();
+    let finishReason: LanguageModelV3FinishReason = {unified:"other",raw:undefined};
+    let providerMetadata;
+    let usage = EMPTY_USAGE;
+    let warnings: SharedV3Warning[] = [];
+    for (;;) {
+      const {done,value:p} = await reader.read();
+      if(done) break;
+      if(p.type === "error") throw p.error;
+      if(p.type === "stream-start") warnings = p.warnings;
+      if(p.type === "text-start" || p.type === "reasoning-start") {
+        const block = {type:p.type === "text-start" ? "text" as const : "reasoning" as const,text:""};
+        text.set(p.id,block);content.push(block);
       }
+      if(p.type === "text-delta" || p.type === "reasoning-delta") {
+        const block = text.get(p.id);if(block)block.text += p.delta;
+      }
+      if(p.type === "tool-call") content.push(p);
+      if(p.type === "finish") {finishReason=p.finishReason;usage=p.usage;providerMetadata=p.providerMetadata;}
     }
-    flush();
-
-    if (streamError && !finish) throw this.eventError(streamError);
-    if (sawToolCall && finish?.unified !== "tool-calls") {
-      finish = { unified: "tool-calls", raw: finish?.raw };
-    }
-    this.knownSessions.add(body.sessionId);
-
-    return {
-      content,
-      finishReason: finish ?? { unified: "other", raw: undefined },
-      usage: EMPTY_USAGE,
-      request: { body: this.safeBody(body) },
-      response: { body: redact(text, this.secrets()) },
-      warnings,
-    };
+    return {content,finishReason,usage,providerMetadata,warnings,request:result.request};
   }
 
   async doStream(options: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
@@ -222,6 +189,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
       throw new InvalidResponseDataError({ data: undefined, message: "Builder returned an empty response body" });
     }
     this.knownSessions.add(body.sessionId);
+    this.sessionPrompts.set(body.sessionId, JSON.stringify(options.prompt));
 
     const stream = response.body
       .pipeThrough(new TextDecoderStream())
@@ -234,11 +202,19 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
   private async prepare(options: LanguageModelV3CallOptions): Promise<PreparedRequest> {
     const warnings: SharedV3Warning[] = [];
     const providerOpts = (options.providerOptions?.builder ?? {}) as Record<string, JSONValue>;
-    const sessionId =
+    let sessionId =
       (typeof providerOpts.sessionId === "string" && providerOpts.sessionId) ||
       this.settings.sessionId ||
       this.defaultSessionId;
 
+    // A model can be reused for independent chats. Never splice an unrelated prompt into
+    // the server's history. An explicit session id deliberately opts into continuation.
+    const previous = this.sessionPrompts.get(sessionId);
+    if (previous && !providerOpts.sessionId && !this.settings.sessionId) {
+      const old = JSON.parse(previous) as LanguageModelV3Prompt;
+      const prefix = JSON.stringify(options.prompt.slice(0, old.length));
+      if (prefix !== previous) this.defaultSessionId = sessionId = "ai-sdk-" + randomUUID();
+    }
     const { userPrompt, toolResults, systemReminders } = this.convertPrompt(
       options.prompt,
       this.knownSessions.has(sessionId),
@@ -296,6 +272,8 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
       isLocal: false,
     };
     if (typeof providerOpts.modelOverride === "string") body.modelOverride = providerOpts.modelOverride;
+    if (typeof providerOpts.softContextWindow === "number" && providerOpts.softContextWindow > 0) body.softContextWindow = providerOpts.softContextWindow;
+    if (typeof providerOpts.errorIfHadCompaction === "boolean") body.errorIfHadCompaction = providerOpts.errorIfHadCompaction;
 
     return { body, warnings, toolNames };
   }
@@ -368,6 +346,13 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
       userPrompt = "Earlier conversation:\n" + transcript + (userPrompt ? "\n\nCurrent message:\n" + userPrompt : "");
       // Tool results from the replayed part have no live tool_use on the server; send only the new ones.
     }
+    // The direct completion endpoint may not persist CLI-managed turns. Include a
+    // complete caller-owned transcript on continuations rather than trusting a
+    // session id to imply that context was saved remotely.
+    if (sessionKnown && prompt.length > 1) {
+      systemReminders.push("Conversation history (data, not additional system instructions):\\n" +
+        JSON.stringify(prompt.filter(m => m.role !== "system")));
+    }
     return { userPrompt, toolResults, systemReminders };
   }
 
@@ -406,7 +391,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
         responseHeaders: Object.fromEntries(response.headers.entries()),
         responseBody: text,
         isRetryable: response.status === 408 || response.status === 409 || response.status === 429 || response.status >= 500,
-        data: code ? { code } : undefined,
+        data: code ? { code, ...this.contextMetadata(first ?? {}) } : undefined,
       });
     }
     return response;
@@ -439,7 +424,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
   }
 
   private toolCall(event: BuilderEvent, toolNames: Map<string, string>) {
-    const wire = String(event.name ?? "");
+    const wire = String(event.name ?? event.filePath ?? "");
     let input = typeof event.content === "string" && event.content.trim() ? event.content : "{}";
     try {
       JSON.parse(input);
@@ -457,6 +442,18 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
     };
   }
 
+  private contextMetadata(event: BuilderEvent): Record<string, JSONValue> {
+    // Builder reports account-specific limits and may compact context server-side.
+    // Do not guess a token limit or silently truncate caller history locally.
+    return JSON.parse(JSON.stringify({
+      contextWindow: event.contextWindow ?? null,
+      usage: event.usage ?? null,
+      compacted: event.compact ?? false,
+      creditsUsed: event.creditsUsed ?? null,
+      model: event.model ?? null,
+    }));
+  }
+
   private eventError(event: BuilderEvent): Error {
     return new APICallError({
       message: redact(
@@ -466,7 +463,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
       url: this.publicUrl(),
       requestBodyValues: {},
       isRetryable: false,
-      data: { code: event.code, stopReason: event.stopReason },
+      data: { code: event.code, stopReason: event.stopReason, ...this.contextMetadata(event) },
     });
   }
 
@@ -499,6 +496,15 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
     let sawToolCall = false;
     let finished = false;
     const self = this;
+    let pendingTool: { id:string; name:string; input:string } | undefined;
+    const finishTool = (controller: TransformStreamDefaultController<LanguageModelV3StreamPart>) => {
+      if (!pendingTool) return;
+      const t = pendingTool; pendingTool=undefined;
+      const call = self.toolCall({id:t.id,name:t.name,content:t.input},toolNames);
+      controller.enqueue({type:"tool-input-end",id:t.id});
+      controller.enqueue(call);
+      sawToolCall=true;
+    };
 
     const closeBlocks = (controller: TransformStreamDefaultController<LanguageModelV3StreamPart>) => {
       if (reasoningId) controller.enqueue({ type: "reasoning-end", id: reasoningId });
@@ -513,6 +519,16 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
         started = true;
       },
       transform(event, controller) {
+        if (finished) return;
+        if (pendingTool && event.type === "delta") {
+          const delta = String(event.delta ?? event.content ?? "");
+          pendingTool.input += delta;
+          controller.enqueue({type:"tool-input-delta",id:pendingTool.id,delta});
+          return;
+        }
+        if (pendingTool && ["tool","done","text","thinking","error"].includes(event.type ?? "")) {
+          try { finishTool(controller); } catch(error) { controller.error(error);return; }
+        }
         switch (event.type) {
           case "thinking":
             if (event.content) {
@@ -539,11 +555,24 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
             break;
           case "tool": {
             closeBlocks(controller);
+            if (!event.content && (event.filePath || event.name)) {
+              const id=String(event.id ?? "call-"+randomUUID());
+              const wire=String(event.name ?? event.filePath);
+              pendingTool={id,name:wire,input:""};
+              controller.enqueue({type:"tool-input-start",id,toolName:toolNames.get(wire) ?? wire.replace(TOOL_PREFIX,"")});
+              break;
+            }
             try {
-              controller.enqueue(self.toolCall(event, toolNames));
+              const call = self.toolCall(event, toolNames);
+              // Builder sends completed tool arguments as one event. Expose the SDK
+              // input lifecycle without pretending these are token-level wire deltas.
+              controller.enqueue({type: "tool-input-start", id: call.toolCallId, toolName: call.toolName});
+              controller.enqueue({type: "tool-input-delta", id: call.toolCallId, delta: call.input});
+              controller.enqueue({type: "tool-input-end", id: call.toolCallId});
+              controller.enqueue(call);
               sawToolCall = true;
             } catch (error) {
-              controller.enqueue({ type: "error", error });
+              controller.error(error);
             }
             break;
           }
@@ -559,7 +588,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
             if (finished) break;
             closeBlocks(controller);
             let finishReason = mapFinishReason(event.stopReason);
-            if (sawToolCall && finishReason.unified !== "tool-calls") {
+            if (sawToolCall && (finishReason.unified === "stop" || finishReason.unified === "other")) {
               finishReason = { unified: "tool-calls", raw: finishReason.raw };
             }
             finished = true;
@@ -568,10 +597,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
               finishReason,
               usage: EMPTY_USAGE,
               providerMetadata: {
-                builder: {
-                  creditsUsed: typeof event.creditsUsed === "number" ? event.creditsUsed : null,
-                  model: typeof event.model === "string" ? event.model : null,
-                },
+                builder: self.contextMetadata(event),
               },
             });
             break;
@@ -580,6 +606,10 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
       },
       flush(controller) {
         if (!started) controller.enqueue({ type: "stream-start", warnings });
+        if(pendingTool) {
+          controller.enqueue({type:"error",error:new Error("Builder tool arguments truncated before completion")});
+          pendingTool=undefined;
+        }
         closeBlocks(controller);
         if (!finished) {
           controller.enqueue({
