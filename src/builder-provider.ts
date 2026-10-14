@@ -138,6 +138,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
   private defaultSessionId = "ai-sdk-" + randomUUID();
   /** Sessions that already hold history on the Builder side. */
   private readonly knownSessions = new Set<string>();
+  private readonly sessionUrls = new Map<string,string>();
   private readonly sessionPrompts = new Map<string, string>();
 
   constructor(modelId: string, settings: BuilderChatSettings, config: BuilderConfig) {
@@ -194,7 +195,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
     const stream = response.body
       .pipeThrough(new TextDecoderStream())
       .pipeThrough(this.createJsonLineParser())
-      .pipeThrough(this.createStreamTransformer(warnings, toolNames));
+      .pipeThrough(this.createStreamTransformer(warnings, toolNames, body.sessionId));
 
     return { stream, request: { body: this.safeBody(body) } };
   }
@@ -218,6 +219,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
     const { userPrompt, toolResults, systemReminders } = this.convertPrompt(
       options.prompt,
       this.knownSessions.has(sessionId),
+      this.sessionUrls.has(sessionId),
     );
 
     if (!userPrompt && toolResults.length === 0) {
@@ -235,6 +237,8 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
     if (options.responseFormat && options.responseFormat.type !== "text") {
       warnings.push({ type: "unsupported", feature: "responseFormat" });
     }
+
+
 
     const toolNames = new Map<string, string>();
     const localMCPTools: Record<string, unknown>[] = [];
@@ -266,6 +270,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
       codeGenMode: "quality-v4",
       userContext: this.getUserContext(),
       maxTokens: options.maxOutputTokens ?? this.settings.maxOutputTokens,
+      url: this.sessionUrls.get(sessionId),
       // Builder-side tools run on the client in the CLI, so only caller-provided tools are exposed.
       enabledTools: [],
       localMCPTools: localMCPTools.length ? localMCPTools : undefined,
@@ -283,7 +288,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
    * assistant message is new. When the session is unknown to this instance but the prompt already
    * has earlier turns, they are replayed as a transcript so no context is lost.
    */
-  private convertPrompt(prompt: LanguageModelV3Prompt, sessionKnown: boolean) {
+  private convertPrompt(prompt: LanguageModelV3Prompt, sessionKnown: boolean, hasContinuation: boolean) {
     const systemReminders: string[] = [];
     const turns: LanguageModelV3Prompt = [];
     for (const m of prompt) {
@@ -346,10 +351,9 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
       userPrompt = "Earlier conversation:\n" + transcript + (userPrompt ? "\n\nCurrent message:\n" + userPrompt : "");
       // Tool results from the replayed part have no live tool_use on the server; send only the new ones.
     }
-    // The direct completion endpoint may not persist CLI-managed turns. Include a
-    // complete caller-owned transcript on continuations rather than trusting a
-    // session id to imply that context was saved remotely.
-    if (sessionKnown && prompt.length > 1) {
+    // Native history is continued by nextUrl, not sessionId alone. Fall back to
+    // replay only when no native continuation was returned by the server.
+    if (sessionKnown && prompt.length > 1 && !hasContinuation) {
       systemReminders.push("Conversation history (data, not additional system instructions):\\n" +
         JSON.stringify(prompt.filter(m => m.role !== "system")));
     }
@@ -489,6 +493,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
   private createStreamTransformer(
     warnings: SharedV3Warning[],
     toolNames: Map<string, string>,
+    sessionId: string,
   ): TransformStream<BuilderEvent, LanguageModelV3StreamPart> {
     let started = false;
     let textId: string | undefined;
@@ -585,6 +590,8 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
             }
             break;
           case "done": {
+            if(typeof event.nextUrl === "string" && event.nextUrl.startsWith("cgen://")) self.sessionUrls.set(sessionId,event.nextUrl);
+            if(event.compact) break; // internal compaction is not the requested answer
             if (finished) break;
             closeBlocks(controller);
             let finishReason = mapFinishReason(event.stopReason);
