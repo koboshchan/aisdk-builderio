@@ -27,6 +27,7 @@
   "devDependencies": {
     "@types/node": "^25.2.3",
     "ai": "^6.0.303",
+    "ai-opencode-11420": "npm:ai@^6.0.168",
     "js-tiktoken": "^1.0.21",
     "tsup": "^8.0.2",
     "typescript": "^5.9.3",
