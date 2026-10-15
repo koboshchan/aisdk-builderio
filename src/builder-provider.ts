@@ -64,6 +64,32 @@ const EMPTY_USAGE: LanguageModelV3Usage = {
   outputTokens: { total: undefined, text: undefined, reasoning: undefined },
 };
 
+// Only explicit token counters are tokens. Builder also uses "usage" for
+// account/credit totals; never reinterpret those values as token counts.
+function mapUsage(value: unknown): LanguageModelV3Usage {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return EMPTY_USAGE;
+  const u = value as Record<string, unknown>;
+  const count = (...keys: string[]) => {
+    for (const key of keys) {
+      const n = u[key];
+      if (typeof n === "number" && Number.isFinite(n) && n >= 0) return n;
+    }
+    return undefined;
+  };
+  const input = count("inputTokens", "input_tokens", "promptTokens", "prompt_tokens");
+  const output = count("outputTokens", "output_tokens", "completionTokens", "completion_tokens");
+  if (input === undefined && output === undefined) return EMPTY_USAGE;
+  return {
+    inputTokens: { ...EMPTY_USAGE.inputTokens, total: input },
+    outputTokens: { ...EMPTY_USAGE.outputTokens, total: output },
+  };
+}
+
+function stripJsonFence(text: string): string {
+  const match = /^\s*```(?:json)?\s*\n?([\s\S]*?)\n?\s*```\s*$/i.exec(text);
+  return match ? match[1].trim() : text;
+}
+
 export function mapFinishReason(reason?: string | null): LanguageModelV3FinishReason {
   const raw = reason ?? undefined;
   switch (reason) {
@@ -195,7 +221,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
     const stream = response.body
       .pipeThrough(new TextDecoderStream())
       .pipeThrough(this.createJsonLineParser())
-      .pipeThrough(this.createStreamTransformer(warnings, toolNames, body.sessionId));
+      .pipeThrough(this.createStreamTransformer(warnings, toolNames, body.sessionId, options.responseFormat?.type === "json"));
 
     return { stream, request: { body: this.safeBody(body) } };
   }
@@ -222,10 +248,13 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
       this.sessionUrls.has(sessionId),
     );
 
+    const hasImages = options.prompt.some(m => m.role === "user" && m.content.some(p =>
+      (p as { type: string }).type === "image" || (p.type === "file" && p.mediaType.startsWith("image/")),
+    ));
     if (!userPrompt && toolResults.length === 0) {
       throw new InvalidResponseDataError({
         data: undefined,
-        message: "Builder request needs a user message or tool results",
+        message: hasImages ? "Builder does not support image input; include a text message." : "Builder request needs a user message or tool results",
       });
     }
 
@@ -234,8 +263,14 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
         warnings.push({ type: "unsupported", feature, details: "Builder's completion API ignores this setting." });
       }
     }
-    if (options.responseFormat && options.responseFormat.type !== "text") {
-      warnings.push({ type: "unsupported", feature: "responseFormat" });
+    if (options.responseFormat?.type === "json") {
+      systemReminders.push(
+        "Reply with only valid JSON, no prose or code fences." +
+        (options.responseFormat.schema ? "\nJSON schema: " + JSON.stringify(options.responseFormat.schema) : ""),
+      );
+    }
+    if (hasImages) {
+      warnings.push({ type: "unsupported", feature: "image input", details: "Builder cannot see images; only text is forwarded." });
     }
 
 
@@ -494,7 +529,9 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
     warnings: SharedV3Warning[],
     toolNames: Map<string, string>,
     sessionId: string,
+    jsonMode: boolean,
   ): TransformStream<BuilderEvent, LanguageModelV3StreamPart> {
+    let jsonText = "";
     let started = false;
     let textId: string | undefined;
     let reasoningId: string | undefined;
@@ -513,7 +550,13 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
 
     const closeBlocks = (controller: TransformStreamDefaultController<LanguageModelV3StreamPart>) => {
       if (reasoningId) controller.enqueue({ type: "reasoning-end", id: reasoningId });
-      if (textId) controller.enqueue({ type: "text-end", id: textId });
+      if (textId) {
+        if (jsonMode && jsonText) {
+          controller.enqueue({ type: "text-delta", id: textId, delta: stripJsonFence(jsonText) });
+          jsonText = "";
+        }
+        controller.enqueue({ type: "text-end", id: textId });
+      }
       reasoningId = undefined;
       textId = undefined;
     };
@@ -555,7 +598,8 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
                 textId = "text-" + randomUUID();
                 controller.enqueue({ type: "text-start", id: textId });
               }
-              controller.enqueue({ type: "text-delta", id: textId, delta: event.content });
+              if (jsonMode) jsonText += event.content;
+              else controller.enqueue({ type: "text-delta", id: textId, delta: event.content });
             }
             break;
           case "tool": {
@@ -602,7 +646,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
             controller.enqueue({
               type: "finish",
               finishReason,
-              usage: EMPTY_USAGE,
+              usage: mapUsage(event.usage),
               providerMetadata: {
                 builder: self.contextMetadata(event),
               },
