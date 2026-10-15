@@ -41,7 +41,9 @@ declare class BuilderChatLanguageModel implements LanguageModelV3 {
     private readonly sessionUrls;
     private readonly sessionPrompts;
     constructor(modelId: string, settings: BuilderChatSettings, config: BuilderConfig);
-    get supportedUrls(): {};
+    get supportedUrls(): {
+        "image/*": RegExp[];
+    };
     private secrets;
     doGenerate(options: LanguageModelV3CallOptions): Promise<LanguageModelV3GenerateResult>;
     doStream(options: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult>;

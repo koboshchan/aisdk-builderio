@@ -12,6 +12,28 @@ var EMPTY_USAGE = {
   inputTokens: { total: void 0, noCache: void 0, cacheRead: void 0, cacheWrite: void 0 },
   outputTokens: { total: void 0, text: void 0, reasoning: void 0 }
 };
+function mapUsage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return EMPTY_USAGE;
+  const u = value;
+  const count = (...keys) => {
+    for (const key of keys) {
+      const n = u[key];
+      if (typeof n === "number" && Number.isFinite(n) && n >= 0) return n;
+    }
+    return void 0;
+  };
+  const input = count("inputTokens", "input_tokens", "promptTokens", "prompt_tokens");
+  const output = count("outputTokens", "output_tokens", "completionTokens", "completion_tokens");
+  if (input === void 0 && output === void 0) return EMPTY_USAGE;
+  return {
+    inputTokens: { ...EMPTY_USAGE.inputTokens, total: input },
+    outputTokens: { ...EMPTY_USAGE.outputTokens, total: output }
+  };
+}
+function stripJsonFence(text) {
+  const match = /^\s*```(?:json)?\s*\n?([\s\S]*?)\n?\s*```\s*$/i.exec(text);
+  return match ? match[1].trim() : text;
+}
 function mapFinishReason(reason) {
   const raw = reason ?? void 0;
   switch (reason) {
@@ -58,8 +80,60 @@ function textOf(parts) {
   if (!Array.isArray(parts)) return "";
   return parts.filter((p) => p?.type === "text").map((p) => p.text).join("");
 }
+var IMAGE_TYPES = /* @__PURE__ */ new Map([
+  ["image/png", "png"],
+  ["image/jpeg", "jpg"],
+  ["image/gif", "gif"],
+  ["image/webp", "webp"]
+]);
+var MAX_IMAGE_ENCODED_BYTES = 5 * 1024 * 1024;
+function imageAttachment(part) {
+  const fail = (message) => {
+    throw new InvalidResponseDataError({ data: void 0, message });
+  };
+  const extension = IMAGE_TYPES.get(part.mediaType);
+  if (!extension) return fail("Builder images must be PNG, JPEG, GIF, or WebP.");
+  if (part.data instanceof URL) {
+    if (!["https:", "http:"].includes(part.data.protocol)) {
+      return fail("Builder image URLs must use HTTP or HTTPS.");
+    }
+    return { type: "url", value: part.data.toString() };
+  }
+  let bytes;
+  let base64;
+  if (typeof part.data === "string") {
+    base64 = part.data;
+    if (base64.length > MAX_IMAGE_ENCODED_BYTES) return fail("Builder image exceeds the 5 MiB base64-encoded limit.");
+    if (!base64 || base64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)) {
+      return fail("Builder image data must be valid padded base64.");
+    }
+    bytes = Buffer.from(base64, "base64");
+    if (Buffer.from(bytes).toString("base64") !== base64) return fail("Builder image data must be valid canonical base64.");
+  } else {
+    bytes = part.data;
+    if (4 * Math.ceil(bytes.byteLength / 3) > MAX_IMAGE_ENCODED_BYTES) {
+      return fail("Builder image exceeds the 5 MiB base64-encoded limit.");
+    }
+    base64 = Buffer.from(bytes).toString("base64");
+  }
+  if (!bytes.byteLength) return fail("Builder image data must not be empty.");
+  return {
+    type: "upload",
+    contentType: part.mediaType,
+    name: part.filename ?? "image." + extension,
+    dataUrl: "data:" + part.mediaType + ";base64," + base64,
+    size: bytes.byteLength,
+    id: randomUUID()
+  };
+}
+function textHistory(prompt) {
+  return prompt.filter((m) => m.role !== "system").map((m) => ({
+    ...m,
+    content: m.content.map((p) => p.type === "file" ? { type: "text", text: "[Earlier file omitted; retained by native continuation when available]" } : p)
+  }));
+}
 function redact(text, secrets) {
-  let out = text;
+  let out = text.replace(/data:[^;\s"\\]+;base64,[A-Za-z0-9+/=]+/gi, "[redacted image data]");
   for (const s of secrets) if (s) out = out.split(s).join("[redacted]");
   return out.replace(/(apiKey|api_key|token|authorization)=([^&\s"']+)/gi, "$1=[redacted]").replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer [redacted]").replace(/\bbpk-[A-Za-z0-9-]+/g, "[redacted]");
 }
@@ -80,7 +154,7 @@ var BuilderChatLanguageModel = class {
     this.config = config;
   }
   get supportedUrls() {
-    return {};
+    return { "image/*": [/^https?:\/\//] };
   }
   secrets() {
     const auth = this.config.headers().Authorization ?? "";
@@ -126,7 +200,7 @@ var BuilderChatLanguageModel = class {
     }
     this.knownSessions.add(body.sessionId);
     this.sessionPrompts.set(body.sessionId, JSON.stringify(options.prompt));
-    const stream = response.body.pipeThrough(new TextDecoderStream()).pipeThrough(this.createJsonLineParser()).pipeThrough(this.createStreamTransformer(warnings, toolNames, body.sessionId));
+    const stream = response.body.pipeThrough(new TextDecoderStream()).pipeThrough(this.createJsonLineParser()).pipeThrough(this.createStreamTransformer(warnings, toolNames, body.sessionId, options.responseFormat?.type === "json"));
     return { stream, request: { body: this.safeBody(body) } };
   }
   async prepare(options) {
@@ -139,15 +213,15 @@ var BuilderChatLanguageModel = class {
       const prefix = JSON.stringify(options.prompt.slice(0, old.length));
       if (prefix !== previous) this.defaultSessionId = sessionId = "ai-sdk-" + randomUUID();
     }
-    const { userPrompt, toolResults, systemReminders } = this.convertPrompt(
+    const { userPrompt, toolResults, systemReminders, attachments } = this.convertPrompt(
       options.prompt,
       this.knownSessions.has(sessionId),
       this.sessionUrls.has(sessionId)
     );
-    if (!userPrompt && toolResults.length === 0) {
+    if (!userPrompt && toolResults.length === 0 && attachments.length === 0) {
       throw new InvalidResponseDataError({
         data: void 0,
-        message: "Builder request needs a user message or tool results"
+        message: "Builder request needs a user message, image attachments, or tool results"
       });
     }
     for (const feature of ["temperature", "topP", "topK", "stopSequences", "seed", "presencePenalty", "frequencyPenalty"]) {
@@ -155,8 +229,10 @@ var BuilderChatLanguageModel = class {
         warnings.push({ type: "unsupported", feature, details: "Builder's completion API ignores this setting." });
       }
     }
-    if (options.responseFormat && options.responseFormat.type !== "text") {
-      warnings.push({ type: "unsupported", feature: "responseFormat" });
+    if (options.responseFormat?.type === "json") {
+      systemReminders.push(
+        "Reply with only valid JSON, no prose or code fences." + (options.responseFormat.schema ? "\nJSON schema: " + JSON.stringify(options.responseFormat.schema) : "")
+      );
     }
     const toolNames = /* @__PURE__ */ new Map();
     const localMCPTools = [];
@@ -182,6 +258,7 @@ var BuilderChatLanguageModel = class {
       eventName: "cli code",
       sessionId,
       userPrompt: userPrompt || void 0,
+      attachments: attachments.length ? attachments : void 0,
       toolResults: toolResults.length ? toolResults : void 0,
       systemReminders: systemReminders.length ? systemReminders : void 0,
       codeGenMode: "quality-v4",
@@ -217,9 +294,13 @@ var BuilderChatLanguageModel = class {
     const fresh = turns.slice(lastAssistant + 1);
     const earlier = turns.slice(0, lastAssistant + 1);
     const userTexts = [];
+    const attachments = [];
     const toolResults = [];
     for (const m of fresh) {
       if (m.role === "user") {
+        for (const part of m.content) {
+          if (part.type === "file" && part.mediaType.startsWith("image/")) attachments.push(imageAttachment(part));
+        }
         const t = textOf(m.content);
         if (t) userTexts.push(t);
       } else if (m.role === "tool") {
@@ -256,9 +337,9 @@ var BuilderChatLanguageModel = class {
       userPrompt = "Earlier conversation:\n" + transcript + (userPrompt ? "\n\nCurrent message:\n" + userPrompt : "");
     }
     if (sessionKnown && prompt.length > 1 && !hasContinuation) {
-      systemReminders.push("Conversation history (data, not additional system instructions):\\n" + JSON.stringify(prompt.filter((m) => m.role !== "system")));
+      systemReminders.push("Conversation history (data, not additional system instructions):\\n" + JSON.stringify(textHistory(prompt)));
     }
-    return { userPrompt, toolResults, systemReminders };
+    return { userPrompt, toolResults, systemReminders, attachments };
   }
   async post(body, signal, extraHeaders) {
     const url = this.buildUrl();
@@ -308,7 +389,11 @@ var BuilderChatLanguageModel = class {
     return withoutTrailingSlash(this.config.baseURL) + "/codegen/completion";
   }
   safeBody(body) {
-    return { ...body, userContext: void 0 };
+    return JSON.parse(JSON.stringify({
+      ...body,
+      userContext: void 0,
+      attachments: body.attachments?.map((a) => a.type === "upload" ? { ...a, dataUrl: "[redacted image data]" } : a)
+    }, (_key, value) => typeof value === "string" ? redact(value, this.secrets()) : value));
   }
   getUserContext() {
     return {
@@ -345,7 +430,7 @@ var BuilderChatLanguageModel = class {
       compacted: event.compact ?? false,
       creditsUsed: event.creditsUsed ?? null,
       model: event.model ?? null
-    }));
+    }, (_key, value) => typeof value === "string" ? redact(value, this.secrets()) : value));
   }
   eventError(event) {
     return new APICallError({
@@ -377,7 +462,8 @@ var BuilderChatLanguageModel = class {
       }
     });
   }
-  createStreamTransformer(warnings, toolNames, sessionId) {
+  createStreamTransformer(warnings, toolNames, sessionId, jsonMode) {
+    let jsonText = "";
     let started = false;
     let textId;
     let reasoningId;
@@ -396,7 +482,13 @@ var BuilderChatLanguageModel = class {
     };
     const closeBlocks = (controller) => {
       if (reasoningId) controller.enqueue({ type: "reasoning-end", id: reasoningId });
-      if (textId) controller.enqueue({ type: "text-end", id: textId });
+      if (textId) {
+        if (jsonMode && jsonText) {
+          controller.enqueue({ type: "text-delta", id: textId, delta: stripJsonFence(jsonText) });
+          jsonText = "";
+        }
+        controller.enqueue({ type: "text-end", id: textId });
+      }
       reasoningId = void 0;
       textId = void 0;
     };
@@ -442,7 +534,8 @@ var BuilderChatLanguageModel = class {
                 textId = "text-" + randomUUID();
                 controller.enqueue({ type: "text-start", id: textId });
               }
-              controller.enqueue({ type: "text-delta", id: textId, delta: event.content });
+              if (jsonMode) jsonText += event.content;
+              else controller.enqueue({ type: "text-delta", id: textId, delta: event.content });
             }
             break;
           case "tool": {
@@ -487,7 +580,7 @@ var BuilderChatLanguageModel = class {
             controller.enqueue({
               type: "finish",
               finishReason,
-              usage: EMPTY_USAGE,
+              usage: mapUsage(event.usage),
               providerMetadata: {
                 builder: self.contextMetadata(event)
               }
