@@ -62,6 +62,11 @@ Every push to `main` builds, tests, and publishes the package to `dist`. The wor
 
 ## Output and backend limits
 
+`maxOutputTokens` (including the model setting) is not forwarded as Builder's `maxTokens`. Explicit caps have produced repeated compaction-only replies, even with small prompts. Supplying it emits an AI SDK unsupported-setting warning. This provider therefore does not enforce an output token cap; use prompt instructions for approximate length, not a hard limit. This does not truncate or limit long input prompts.
+
+Compaction-only responses and completed responses with no answer text or tool call surface a `BuilderProviderError` (`code: "compaction-only"` or `"empty-response"`). `doGenerate` rejects; streams emit an error part followed by an error finish, not a successful empty answer. Internal compaction followed by a real answer or tool call still works. There are no automatic retries or paid continuation requests.
+
+
 JSON response format is emulated with a system reminder, including the caller's JSON schema when supplied. The provider removes a surrounding JSON Markdown fence. This is not constrained decoding or a schema guarantee; keep AI SDK validation and handle validation failures. JSON-mode text is buffered until the text block ends so fences split across chunks can be removed. Normal text streaming stays incremental.
 
 Image input supports PNG, JPEG, GIF, and WebP, including multiple images and image-only prompts. AI SDK file bytes/base64 become inline Builder uploads (maximum 5 MiB of base64 per image); HTTP(S) image URLs become URL attachments. Only new user turns send attachments, not historical images. Earlier images require native server continuation to retain visual context; textual history replay omits their binary payloads. Inline image data is redacted from request/error metadata. The wire format follows the Builder CLI; visual receipt has not been verified with a live paid call.

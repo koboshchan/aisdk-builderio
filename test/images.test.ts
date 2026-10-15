@@ -18,7 +18,7 @@ function setup(options: { status?: number; native?: boolean; echo?: boolean; net
       const event = options.echo
         ? { type: "error", message: echoed, usage: { detail: echoed } }
         : { type: "done", stopReason: "end_turn", nextUrl: options.native ? "cgen://next" : undefined };
-      return new Response(JSON.stringify(event) + "\n", { status: options.status ?? 200 });
+      return new Response((options.echo ? "" : JSON.stringify({ type: "text", content: "ok" }) + "\n") + JSON.stringify(event) + "\n", { status: options.status ?? 200 });
     }) as typeof fetch,
   })("test");
   return { m, calls };
