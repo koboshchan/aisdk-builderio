@@ -1,5 +1,10 @@
 import { LanguageModelV3, LanguageModelV3CallOptions, LanguageModelV3GenerateResult, LanguageModelV3StreamResult, LanguageModelV3FinishReason } from '@ai-sdk/provider';
 
+/** A completed Builder response that contains no answer or tool call. */
+declare class BuilderProviderError extends Error {
+    readonly code: "compaction-only" | "empty-response";
+    constructor(code: "compaction-only" | "empty-response");
+}
 interface BuilderProviderSettings {
     baseURL?: string;
     apiKey: string;
@@ -10,6 +15,7 @@ interface BuilderProviderSettings {
 }
 interface BuilderChatSettings {
     temperature?: number;
+    /** Not forwarded: Builder caps can trigger compaction-only responses. */
     maxOutputTokens?: number;
     topP?: number;
     /** Builder session to continue. Defaults to one session per model instance. */
@@ -68,4 +74,4 @@ declare class BuilderChatLanguageModel implements LanguageModelV3 {
 }
 declare function createBuilder(options: BuilderProviderSettings): BuilderProvider;
 
-export { BuilderChatLanguageModel, type BuilderChatSettings, type BuilderProvider, type BuilderProviderSettings, createBuilder, mapFinishReason, redact };
+export { BuilderChatLanguageModel, type BuilderChatSettings, type BuilderProvider, BuilderProviderError, type BuilderProviderSettings, createBuilder, mapFinishReason, redact };

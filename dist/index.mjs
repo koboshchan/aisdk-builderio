@@ -6,6 +6,14 @@ import {
 import { loadApiKey, withoutTrailingSlash } from "@ai-sdk/provider-utils";
 import { randomUUID } from "crypto";
 import os from "os";
+var BuilderProviderError = class extends Error {
+  code;
+  constructor(code) {
+    super(code === "compaction-only" ? "Builder returned only conversation compaction events, without an answer or tool call. Explicit maxTokens caps can cause this; omit the cap and retry explicitly." : "Builder completed without any answer text or tool call.");
+    this.name = "BuilderProviderError";
+    this.code = code;
+  }
+};
 var TOOL_SERVER = "ai-sdk";
 var TOOL_PREFIX = "mcp__" + TOOL_SERVER + "__";
 var EMPTY_USAGE = {
@@ -229,6 +237,13 @@ var BuilderChatLanguageModel = class {
         warnings.push({ type: "unsupported", feature, details: "Builder's completion API ignores this setting." });
       }
     }
+    if ((options.maxOutputTokens ?? this.settings.maxOutputTokens) !== void 0) {
+      warnings.push({
+        type: "unsupported",
+        feature: "maxOutputTokens",
+        details: "Not forwarded as Builder maxTokens because explicit caps can trigger compaction-only replies. Output length is not capped by this provider."
+      });
+    }
     if (options.responseFormat?.type === "json") {
       systemReminders.push(
         "Reply with only valid JSON, no prose or code fences." + (options.responseFormat.schema ? "\nJSON schema: " + JSON.stringify(options.responseFormat.schema) : "")
@@ -263,7 +278,6 @@ var BuilderChatLanguageModel = class {
       systemReminders: systemReminders.length ? systemReminders : void 0,
       codeGenMode: "quality-v4",
       userContext: this.getUserContext(),
-      maxTokens: options.maxOutputTokens ?? this.settings.maxOutputTokens,
       url: this.sessionUrls.get(sessionId),
       // Builder-side tools run on the client in the CLI, so only caller-provided tools are exposed.
       enabledTools: [],
@@ -468,6 +482,8 @@ var BuilderChatLanguageModel = class {
     let textId;
     let reasoningId;
     let sawToolCall = false;
+    let sawAnswerText = false;
+    let sawCompaction = false;
     let finished = false;
     const self = this;
     let pendingTool;
@@ -526,6 +542,7 @@ var BuilderChatLanguageModel = class {
           case "delta":
           case "text":
             if (event.content) {
+              if (String(event.content).trim()) sawAnswerText = true;
               if (reasoningId) {
                 controller.enqueue({ type: "reasoning-end", id: reasoningId });
                 reasoningId = void 0;
@@ -569,9 +586,18 @@ var BuilderChatLanguageModel = class {
             break;
           case "done": {
             if (typeof event.nextUrl === "string" && event.nextUrl.startsWith("cgen://")) self.sessionUrls.set(sessionId, event.nextUrl);
-            if (event.compact) break;
+            if (event.compact) {
+              sawCompaction = true;
+              break;
+            }
             if (finished) break;
             closeBlocks(controller);
+            if (!sawAnswerText && !sawToolCall) {
+              controller.enqueue({ type: "error", error: new BuilderProviderError(sawCompaction ? "compaction-only" : "empty-response") });
+              finished = true;
+              controller.enqueue({ type: "finish", finishReason: { unified: "error", raw: "empty-response" }, usage: mapUsage(event.usage) });
+              break;
+            }
             let finishReason = mapFinishReason(event.stopReason);
             if (sawToolCall && (finishReason.unified === "stop" || finishReason.unified === "other")) {
               finishReason = { unified: "tool-calls", raw: finishReason.raw };
@@ -599,7 +625,7 @@ var BuilderChatLanguageModel = class {
         if (!finished) {
           controller.enqueue({
             type: "error",
-            error: new InvalidResponseDataError({ data: void 0, message: "Builder stream ended without a done event" })
+            error: sawCompaction && !sawAnswerText && !sawToolCall ? new BuilderProviderError("compaction-only") : new InvalidResponseDataError({ data: void 0, message: "Builder stream ended without a done event" })
           });
           controller.enqueue({ type: "finish", finishReason: { unified: "error", raw: "truncated" }, usage: EMPTY_USAGE });
         }
@@ -642,6 +668,7 @@ function createBuilder(options) {
 }
 export {
   BuilderChatLanguageModel,
+  BuilderProviderError,
   createBuilder,
   mapFinishReason,
   redact
