@@ -64,7 +64,7 @@ Every push to `main` builds, tests, and publishes the package to `dist`. The wor
 
 JSON response format is emulated with a system reminder, including the caller's JSON schema when supplied. The provider removes a surrounding JSON Markdown fence. This is not constrained decoding or a schema guarantee; keep AI SDK validation and handle validation failures. JSON-mode text is buffered until the text block ends so fences split across chunks can be removed. Normal text streaming stays incremental.
 
-Builder cannot see images. Image attachments produce an unsupported warning with feature `image input`; only text is forwarded. Image-only requests without any usable text or tool results fail with a clear error.
+Image input supports PNG, JPEG, GIF, and WebP, including multiple images and image-only prompts. AI SDK file bytes/base64 become inline Builder uploads (maximum 5 MiB of base64 per image); HTTP(S) image URLs become URL attachments. Only new user turns send attachments, not historical images. Earlier images require native server continuation to retain visual context; textual history replay omits their binary payloads. Inline image data is redacted from request/error metadata. The wire format follows the Builder CLI; visual receipt has not been verified with a live paid call.
 
 Explicit token counters in a final `done.usage` are forwarded to AI SDK input/output usage, from which the SDK computes `totalTokens`. Missing counters stay undefined, not zero. Some backend versions return account usage (`total`, `fast`, `quality`, limits) rather than token usage. Those are not token counts and remain available in `providerMetadata.builder.usage`, along with `contextWindow` and `creditsUsed`; they are never relabeled as tokens.
 

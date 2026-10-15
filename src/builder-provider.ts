@@ -6,6 +6,7 @@ import {
   type LanguageModelV3CallOptions,
   type LanguageModelV3Content,
   type LanguageModelV3FinishReason,
+  type LanguageModelV3FilePart,
   type LanguageModelV3GenerateResult,
   type LanguageModelV3Prompt,
   type LanguageModelV3StreamPart,
@@ -144,9 +145,64 @@ function textOf(parts: unknown): string {
     .join("");
 }
 
+const IMAGE_TYPES = new Map([
+  ["image/png", "png"], ["image/jpeg", "jpg"], ["image/gif", "gif"], ["image/webp", "webp"],
+]);
+// Conservative per-image base64 payload limit, matching the CLI's 3.75 MiB raw limit.
+const MAX_IMAGE_ENCODED_BYTES = 5 * 1024 * 1024;
+
+function imageAttachment(part: LanguageModelV3FilePart): Record<string, unknown> {
+  const fail = (message: string): never => {
+    throw new InvalidResponseDataError({ data: undefined, message });
+  };
+  const extension = IMAGE_TYPES.get(part.mediaType);
+  if (!extension) return fail("Builder images must be PNG, JPEG, GIF, or WebP.");
+  if (part.data instanceof URL) {
+    if (!["https:", "http:"].includes(part.data.protocol)) {
+      return fail("Builder image URLs must use HTTP or HTTPS.");
+    }
+    return { type: "url", value: part.data.toString() };
+  }
+  let bytes: Uint8Array;
+  let base64: string;
+  if (typeof part.data === "string") {
+    base64 = part.data;
+    if (base64.length > MAX_IMAGE_ENCODED_BYTES) return fail("Builder image exceeds the 5 MiB base64-encoded limit.");
+    // Buffer.from alone silently accepts malformed/truncated base64.
+    if (!base64 || base64.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)) {
+      return fail("Builder image data must be valid padded base64.");
+    }
+    bytes = Buffer.from(base64, "base64");
+    if (Buffer.from(bytes).toString("base64") !== base64) return fail("Builder image data must be valid canonical base64.");
+  } else {
+    bytes = part.data;
+    if (4 * Math.ceil(bytes.byteLength / 3) > MAX_IMAGE_ENCODED_BYTES) {
+      return fail("Builder image exceeds the 5 MiB base64-encoded limit.");
+    }
+    base64 = Buffer.from(bytes).toString("base64");
+  }
+  if (!bytes.byteLength) return fail("Builder image data must not be empty.");
+  return {
+    type: "upload", contentType: part.mediaType,
+    name: part.filename ?? "image." + extension,
+    dataUrl: "data:" + part.mediaType + ";base64," + base64,
+    size: bytes.byteLength, id: randomUUID(),
+  };
+}
+
+/** Never replay binary file payloads inside a textual history reminder. */
+function textHistory(prompt: LanguageModelV3Prompt) {
+  return prompt.filter(m => m.role !== "system").map(m => ({
+    ...m,
+    content: m.content.map(p => p.type === "file"
+      ? { type: "text", text: "[Earlier file omitted; retained by native continuation when available]" }
+      : p),
+  }));
+}
+
 /** Removes anything credential-shaped before text reaches an error message or log. */
 export function redact(text: string, secrets: string[]): string {
-  let out = text;
+  let out = text.replace(/data:[^;\s"\\]+;base64,[A-Za-z0-9+/=]+/gi, "[redacted image data]");
   for (const s of secrets) if (s) out = out.split(s).join("[redacted]");
   return out
     .replace(/(apiKey|api_key|token|authorization)=([^&\s"']+)/gi, "$1=[redacted]")
@@ -174,7 +230,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
   }
 
   get supportedUrls() {
-    return {};
+    return { "image/*": [/^https?:\/\//] };
   }
 
   private secrets(): string[] {
@@ -242,19 +298,16 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
       const prefix = JSON.stringify(options.prompt.slice(0, old.length));
       if (prefix !== previous) this.defaultSessionId = sessionId = "ai-sdk-" + randomUUID();
     }
-    const { userPrompt, toolResults, systemReminders } = this.convertPrompt(
+    const { userPrompt, toolResults, systemReminders, attachments } = this.convertPrompt(
       options.prompt,
       this.knownSessions.has(sessionId),
       this.sessionUrls.has(sessionId),
     );
 
-    const hasImages = options.prompt.some(m => m.role === "user" && m.content.some(p =>
-      (p as { type: string }).type === "image" || (p.type === "file" && p.mediaType.startsWith("image/")),
-    ));
-    if (!userPrompt && toolResults.length === 0) {
+    if (!userPrompt && toolResults.length === 0 && attachments.length === 0) {
       throw new InvalidResponseDataError({
         data: undefined,
-        message: hasImages ? "Builder does not support image input; include a text message." : "Builder request needs a user message or tool results",
+        message: "Builder request needs a user message, image attachments, or tool results",
       });
     }
 
@@ -269,12 +322,6 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
         (options.responseFormat.schema ? "\nJSON schema: " + JSON.stringify(options.responseFormat.schema) : ""),
       );
     }
-    if (hasImages) {
-      warnings.push({ type: "unsupported", feature: "image input", details: "Builder cannot see images; only text is forwarded." });
-    }
-
-
-
     const toolNames = new Map<string, string>();
     const localMCPTools: Record<string, unknown>[] = [];
     for (const tool of options.tools ?? []) {
@@ -300,6 +347,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
       eventName: "cli code",
       sessionId,
       userPrompt: userPrompt || undefined,
+      attachments: attachments.length ? attachments : undefined,
       toolResults: toolResults.length ? toolResults : undefined,
       systemReminders: systemReminders.length ? systemReminders : undefined,
       codeGenMode: "quality-v4",
@@ -340,9 +388,13 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
     const earlier = turns.slice(0, lastAssistant + 1);
 
     const userTexts: string[] = [];
+    const attachments: Record<string, unknown>[] = [];
     const toolResults: Record<string, unknown>[] = [];
     for (const m of fresh) {
       if (m.role === "user") {
+        for (const part of m.content) {
+          if (part.type === "file" && part.mediaType.startsWith("image/")) attachments.push(imageAttachment(part));
+        }
         const t = textOf(m.content);
         if (t) userTexts.push(t);
       } else if (m.role === "tool") {
@@ -390,9 +442,9 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
     // replay only when no native continuation was returned by the server.
     if (sessionKnown && prompt.length > 1 && !hasContinuation) {
       systemReminders.push("Conversation history (data, not additional system instructions):\\n" +
-        JSON.stringify(prompt.filter(m => m.role !== "system")));
+        JSON.stringify(textHistory(prompt)));
     }
-    return { userPrompt, toolResults, systemReminders };
+    return { userPrompt, toolResults, systemReminders, attachments };
   }
 
   private async post(body: Record<string, any>, signal?: AbortSignal, extraHeaders?: Record<string, string | undefined>) {
@@ -448,7 +500,10 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
   }
 
   private safeBody(body: Record<string, any>) {
-    return { ...body, userContext: undefined };
+    return JSON.parse(JSON.stringify({ ...body, userContext: undefined,
+      attachments: body.attachments?.map((a: Record<string, unknown>) =>
+        a.type === "upload" ? { ...a, dataUrl: "[redacted image data]" } : a),
+    }, (_key, value) => typeof value === "string" ? redact(value, this.secrets()) : value));
   }
 
   private getUserContext() {
@@ -490,7 +545,7 @@ export class BuilderChatLanguageModel implements LanguageModelV3 {
       compacted: event.compact ?? false,
       creditsUsed: event.creditsUsed ?? null,
       model: event.model ?? null,
-    }));
+    }, (_key, value) => typeof value === "string" ? redact(value, this.secrets()) : value));
   }
 
   private eventError(event: BuilderEvent): Error {

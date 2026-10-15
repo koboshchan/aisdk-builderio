@@ -86,25 +86,3 @@ describe("JSON response emulation", () => {
     expect(r.content).toEqual([{ type: "text", text: content }]);
   });
 });
-
-describe("image warnings", () => {
-  it("warns for SDK v3 image files including historical turns", async () => {
-    const imagePrompt: LanguageModelV3CallOptions["prompt"] = [
-      { role: "user", content: [{ type: "text", text: "look" }, { type: "file", mediaType: "image/png", data: new Uint8Array([1]) }] },
-      { role: "assistant", content: [{ type: "text", text: "ok" }] },
-      ...prompt,
-    ];
-    const r = await model([done()]).doGenerate({ prompt: imagePrompt });
-    expect(r.warnings).toContainEqual(expect.objectContaining({ type: "unsupported", feature: "image input" }));
-    const ps = await parts(model([done()]), { prompt: imagePrompt });
-    expect(ps[0]).toMatchObject({ type: "stream-start", warnings: r.warnings });
-  });
-  it("rejects image-only requests with a clear error", async () => {
-    await expect(model([done()]).doGenerate({ prompt: [{ role: "user", content: [
-      { type: "file", mediaType: "image/png", data: new Uint8Array([1]) },
-    ] }] })).rejects.toThrow("does not support image input");
-  });
-  it("does not warn for text-only prompts", async () => {
-    expect((await model([done()]).doGenerate({ prompt })).warnings).toEqual([]);
-  });
-});
