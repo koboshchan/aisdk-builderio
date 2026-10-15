@@ -32,10 +32,10 @@ describe("token usage", () => {
     { input_tokens: 12, output_tokens: 5 },
     { prompt_tokens: 12, completion_tokens: 5 },
   ])("maps explicit token counts for generate and stream: %j", async usage => {
-    const r = await model([done(usage)]).doGenerate({ prompt });
+    const r = await model([{ type: "text", content: "ok" }, done(usage)]).doGenerate({ prompt });
     expect(r.usage.inputTokens.total).toBe(12);
     expect(r.usage.outputTokens.total).toBe(5);
-    const ps = await parts(model([done(usage)]), { prompt });
+    const ps = await parts(model([{ type: "text", content: "ok" }, done(usage)]), { prompt });
     expect(ps.at(-1)).toMatchObject({ type: "finish", usage: r.usage });
   });
   it("AI SDK computes input/output/total for both APIs", async () => {
@@ -47,12 +47,12 @@ describe("token usage", () => {
     expect(await stream.usage).toMatchObject({ inputTokens: 12, outputTokens: 5, totalTokens: 17 });
   });
   it.each([undefined, null, {}, { total: 100, fast: 10, quality: 90 }, { inputTokens: -1, outputTokens: "5" }])("does not invent tokens from %j", async usage => {
-    const r = await model([done(usage)]).doGenerate({ prompt });
+    const r = await model([{ type: "text", content: "ok" }, done(usage)]).doGenerate({ prompt });
     expect(r.usage.inputTokens.total).toBeUndefined();
     expect(r.usage.outputTokens.total).toBeUndefined();
   });
   it("preserves zero and partial counts and ignores internal compaction usage", async () => {
-    const r = await model([{ ...done({ inputTokens: 99, outputTokens: 99 }), compact: true }, done({ inputTokens: 0 })]).doGenerate({ prompt });
+    const r = await model([{ ...done({ inputTokens: 99, outputTokens: 99 }), compact: true }, { type: "text", content: "ok" }, done({ inputTokens: 0 })]).doGenerate({ prompt });
     expect(r.usage.inputTokens.total).toBe(0);
     expect(r.usage.outputTokens.total).toBeUndefined();
   });

@@ -32,7 +32,7 @@ describe("doGenerate", () => {
   });
   it("sends tool results and keeps session", async () => {
     const calls: any[] = [];
-    const m = mk(ndjson({ type: "done", stopReason: "end_turn" }), 200, calls);
+    const m = mk(ndjson({ type: "text", content: "ok" }, { type: "done", stopReason: "end_turn" }), 200, calls);
     await m.doGenerate(base);
     await m.doGenerate({ prompt: [user("hi"), { role: "assistant", content: [{ type: "tool-call", toolCallId: "t1", toolName: "get_w", input: {} }] }, { role: "tool", content: [{ type: "tool-result", toolCallId: "t1", toolName: "get_w", output: { type: "json", value: { ok: 1 } } }] }] });
     expect(calls[1].body.sessionId).toBe(calls[0].body.sessionId);
@@ -41,7 +41,7 @@ describe("doGenerate", () => {
   });
   it("replays earlier turns for unknown session", async () => {
     const calls: any[] = [];
-    const m = mk(ndjson({ type: "done", stopReason: "end_turn" }), 200, calls);
+    const m = mk(ndjson({ type: "text", content: "ok" }, { type: "done", stopReason: "end_turn" }), 200, calls);
     await m.doGenerate({ prompt: [user("my name is Bo"), { role: "assistant", content: [{ type: "text", text: "ok" }] }, user("what is my name")] });
     expect(calls[0].body.userPrompt).toContain("my name is Bo");
     expect(calls[0].body.userPrompt).toContain("what is my name");

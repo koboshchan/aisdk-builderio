@@ -56,7 +56,7 @@ it("unrelated chats on one model do not share history",async()=>{
 });
 it("exposes server compaction, context window and account usage limits without silently truncating",async()=>{
  const done={type:"done",stopReason:"model_context_window_exceeded",compact:false,contextWindow:{usedTokens:123,totalTokens:500},usage:{limits:{aiGenerationContextWindow:400}}};
- const {model,calls}=setup([wire(done)]);
+ const {model,calls}=setup([wire({type:"text",content:"partial answer"},done)]);
  const text="long history ".repeat(1000);
  const r=await model.doGenerate({prompt:[{role:"system",content:"preserve system"},{role:"user",content:[{type:"text",text}]}]});
  expect(calls[0].userPrompt).toBe(text);

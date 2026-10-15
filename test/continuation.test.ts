@@ -25,5 +25,5 @@ it("does not finish on an internal compact done before the requested answer",asy
 });
 it("compaction-only responses fail instead of returning a successful empty answer",async()=>{
  const model=createBuilder({apiKey:"p",userId:"u",privateKey:"s",fetch:(async()=>new Response(wire({type:"done",compact:true,stopReason:"end_turn"}))) as typeof fetch})("test");
- await expect(model.doGenerate({prompt:[{role:"user",content:[{type:"text",text:"hi"}]}]})).rejects.toThrow(/without a done/);
+ await expect(model.doGenerate({prompt:[{role:"user",content:[{type:"text",text:"hi"}]}]})).rejects.toThrow(/only conversation compaction/);
 });
